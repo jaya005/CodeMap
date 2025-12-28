@@ -212,16 +212,18 @@ import streamlit as st
 import graphviz
 import ast
 import os
+import zipfile
+import io
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Try loading .env, but don't crash if it fails (for Cloud deployment)
+# Try loading .env (Local), pass if fails (Cloud)
 try:
     load_dotenv()
 except:
     pass
 
-# --- 1. CLOUD-COMPATIBLE BACKEND LOGIC ---
+# --- 1. BACKEND LOGIC (Handles Zip & Py) ---
 
 def analyze_imports_from_string(source_code):
     """Parses imports from a string of code."""
@@ -243,27 +245,44 @@ def analyze_imports_from_string(source_code):
                     imported_names.add(f"{node.module}.{name.name}")
     return imported_names
 
+def process_file_content(filename, content_bytes, file_content_map, file_name_map):
+    """Helper to decode and store file content."""
+    try:
+        # Create a clean module ID from path: 'src/utils/helper.py' -> 'src.utils.helper'
+        clean_name = filename.replace("\\", "/").replace("/", ".").replace(".py", "")
+        
+        # Decode bytes to string
+        source_code = content_bytes.decode("utf-8")
+        
+        file_content_map[clean_name] = source_code
+        file_name_map[clean_name] = filename
+    except Exception:
+        pass # Skip binary or non-utf8 files
+
 def build_graph_from_uploads(uploaded_files):
-    """Processes uploaded files and preserves folder structure."""
+    """
+    Handles both raw .py files AND .zip archives.
+    """
     file_content_map = {}
     file_name_map = {} 
 
     for uploaded_file in uploaded_files:
-        # Some browsers provide relative paths (folder/file.py)
-        # We replace slashes with dots for Python module notation
-        raw_path = getattr(uploaded_file, "name", uploaded_file.name)
         
-        if raw_path.endswith(".py"):
-            # Clean path to create a module ID: 'folder/sub/file.py' -> 'folder.sub.file'
-            module_path = raw_path.replace("/", ".").replace("\\", ".").replace(".py", "")
-            
-            try:
-                content = uploaded_file.getvalue().decode("utf-8")
-                file_content_map[module_path] = content
-                file_name_map[module_path] = raw_path
-            except Exception:
-                continue # Skip files with encoding issues
+        # CASE A: User uploaded a ZIP file (The best way to upload folders)
+        if uploaded_file.name.endswith(".zip"):
+            with zipfile.ZipFile(uploaded_file) as z:
+                for filename in z.namelist():
+                    if filename.endswith(".py") and not filename.startswith("__MACOSX"):
+                        with z.open(filename) as f:
+                            process_file_content(filename, f.read(), file_content_map, file_name_map)
+                            
+        # CASE B: User uploaded raw .py files
+        elif uploaded_file.name.endswith(".py"):
+            # Use the full path if browser provided it, else filename
+            filename = getattr(uploaded_file, "name", uploaded_file.name)
+            process_file_content(filename, uploaded_file.getvalue(), file_content_map, file_name_map)
 
+    # --- Build Dependency Graph ---
     nodes = []
     edges = set()
 
@@ -275,17 +294,18 @@ def build_graph_from_uploads(uploaded_files):
         for imp in raw_imports:
             target_match = None
             
-            # 1. Direct match (e.g., import utils.helper)
+            # Logic 1: Exact Match (import utils)
             if imp in file_content_map:
                 target_match = imp
-            # 2. Sub-module match (e.g., from utils import helper)
+            
+            # Logic 2: Submodule Match (from utils import helper)
             else:
                 parts = imp.split('.')
-                # Check if the start of the import matches a known local module
+                # Check backwards: utils.helper.func -> check 'utils.helper', then 'utils'
                 for i in range(len(parts), 0, -1):
-                    possible_match = ".".join(parts[:i])
-                    if possible_match in file_content_map:
-                        target_match = possible_match
+                    candidate = ".".join(parts[:i])
+                    if candidate in file_content_map:
+                        target_match = candidate
                         break
 
             if target_match and target_match != current_module:
@@ -311,6 +331,7 @@ class CodeChangeAgent:
         
         if api_key:
             genai.configure(api_key=api_key)
+            # Use stable model
             self.model = genai.GenerativeModel("gemini-1.5-flash") 
         else:
             self.model = None
@@ -329,19 +350,19 @@ class CodeChangeAgent:
         if self.graph_data['edges']:
             edges_desc = "\n".join([f"{e['source']} imports {e['target']}" for e in self.graph_data['edges']])
 
-        # Standard entry points + common streamlit names
-        entry_list = ['app', 'main', 'manage', 'wsgi', 'streamlit_app', 'run']
-        potential_entry_points = [m for m in self.content_map.keys() if any(entry in m for entry in entry_list)]
+        # Identify Entry Points
+        entry_list = ['app', 'main', 'manage', 'wsgi', 'streamlit_app', 'cli']
+        potential_entry_points = [m for m in self.content_map.keys() if any(e in m.lower() for e in entry_list)]
         
         entry_instruction = ""
         if potential_entry_points:
-            entry_instruction = f"CRITICAL: The following are likely ENTRY POINTS (not redundant): {potential_entry_points}"
+            entry_instruction = f"CRITICAL: The following are ENTRY POINTS (Apps): {potential_entry_points}. Do not call them redundant."
 
         prompt = f"""
         You are a Senior Software Architect.
         {entry_instruction}
         
-        PROJECT ARCHITECTURE (Nodes and Edges):
+        PROJECT ARCHITECTURE:
         {edges_desc}
         
         SOURCE CODE:
@@ -350,8 +371,7 @@ class CodeChangeAgent:
         USER QUESTION: {query}
         """
         try:
-            response = self.model.generate_content(prompt)
-            return response.text
+            return self.model.generate_content(prompt).text
         except Exception as e:
             return f"Error: {e}"
 
@@ -365,37 +385,45 @@ if 'chat_history' not in st.session_state:
 
 # --- SIDEBAR ---
 st.sidebar.header("📂 Project Upload")
-# accept_multiple_files allows dragging a whole folder in
+st.sidebar.info("💡 **Tip:** For best results, zip your folder and upload the **.zip** file!")
+
+# Allow Zip OR Multiple Python files
 uploaded_files = st.sidebar.file_uploader(
-    "Drag & drop your PROJECT FOLDER here", 
+    "Upload .zip or .py files:", 
     accept_multiple_files=True, 
-    type=["py"]
+    type=["py", "zip"]
 )
 
 if uploaded_files:
-    if st.sidebar.button("🚀 Analyze Folder Structure"):
-        with st.spinner("Processing directory..."):
+    if st.sidebar.button("🚀 Analyze Files"):
+        with st.spinner("Unzipping and Analyzing..."):
             graph_data = build_graph_from_uploads(uploaded_files)
-            st.session_state['graph'] = graph_data
-            st.session_state['agent'] = CodeChangeAgent(graph_data)
-            st.session_state['chat_history'] = [] 
-            st.success(f"Successfully analyzed {len(graph_data['nodes'])} files!")
+            
+            if not graph_data['nodes']:
+                st.error("No Python files found! Did you upload a valid zip or .py files?")
+            else:
+                st.session_state['graph'] = graph_data
+                st.session_state['agent'] = CodeChangeAgent(graph_data)
+                st.session_state['chat_history'] = [] 
+                st.success(f"Successfully analyzed {len(graph_data['nodes'])} modules!")
 else:
-    st.sidebar.info("👆 Drop your folder above to start.")
+    st.sidebar.info("👆 Upload a .zip of your project to start.")
 
 # --- MAIN UI ---
 
 if 'graph' in st.session_state:
     data = st.session_state['graph']
     
+    # Navigation
     view_mode = st.radio(
-        "Navigation:", 
+        "Menu:", 
         ["🕸️ Architecture Map", "💬 Ask the Codebase"], 
         horizontal=True,
         label_visibility="collapsed"
     )
     st.markdown("---") 
 
+    # VIEW 1
     if view_mode == "🕸️ Architecture Map":
         st.subheader("Dependency Graph")
         viz = graphviz.Digraph()
@@ -403,30 +431,31 @@ if 'graph' in st.session_state:
         viz.attr('node', shape='box', style='filled', fillcolor='#E0F7FA', fontname='Arial')
         
         for node in data['nodes']:
-            # Using module path for ID, filename for label
-            viz.node(node['id'], node['filename']) 
+            viz.node(node['id'], node['filename'])
         for edge in data['edges']:
             viz.edge(edge['source'], edge['target'])
             
         st.graphviz_chart(viz)
 
+    # VIEW 2
     elif view_mode == "💬 Ask the Codebase":
         st.subheader("👩‍💻 Onboarding Assistant")
         
         all_modules = list(data['content_map'].keys())
-        
         selected_modules = st.multiselect(
-            "Select specific files/folders to discuss (Default = All):", 
+            "Select files to discuss (Default = All):", 
             all_modules,
             format_func=lambda x: data['name_map'][x]
         )
         
+        # History
         for msg in st.session_state['chat_history']:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
+        # Input
         with st.form(key="ask_form", clear_on_submit=False):
-            user_query = st.text_input("Ask a question about the codebase:", placeholder="e.g., How does the authentication flow work?")
+            user_query = st.text_input("Ask a question:", placeholder="e.g., Which files are redundant?")
             submit_button = st.form_submit_button("Ask AI")
             
             if submit_button and user_query:
@@ -443,6 +472,3 @@ if 'graph' in st.session_state:
                     with st.chat_message("assistant"):
                         st.markdown(response)
                     st.session_state['chat_history'].append({"role": "assistant", "content": response})
-
-else:
-    st.info("👈 Drop your folder in the sidebar to visualize your code architecture.")
