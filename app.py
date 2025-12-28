@@ -213,114 +213,171 @@ import graphviz
 import ast
 import os
 import zipfile
-import io
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Try loading .env (Local), pass if fails (Cloud)
 try:
     load_dotenv()
 except:
     pass
 
-# --- 1. BACKEND LOGIC (Handles Zip & Py) ---
+# --- 1. ROBUST IMPORT RESOLVER ---
+
+def normalize_path_to_module(path):
+    """Converts file path to python module path: 'folder/sub/file.py' -> 'folder.sub.file'"""
+    return path.replace("\\", "/").replace("/", ".").replace(".py", "")
+
+def get_parent_package(module_name, level):
+    """Calculates parent package for relative imports (..utils)"""
+    parts = module_name.split(".")
+    if len(parts) < level:
+        return ""
+    return ".".join(parts[:-level])
+
+def resolve_import(import_name, current_module, all_modules, level=0):
+    """
+    STRICT Python Import Resolution Logic.
+    
+    1. Handle Relative Imports (level > 0):
+       - If inside 'pkg.sub.module' and imports '..utils', look for 'pkg.utils'.
+       
+    2. Handle Absolute Imports (level == 0):
+       - Exact Match: 'scrapers.run' -> matches 'scrapers.run'.
+       - Root Handling: If user uploaded 'project/scrapers/run.py' but code says 'import scrapers.run',
+         we detect that 'project' is just a container and match 'scrapers.run' inside it.
+    """
+    target = None
+
+    # --- CASE 1: Relative Import (from . import x or from .. import y) ---
+    if level > 0:
+        parent_package = get_parent_package(current_module, level)
+        if parent_package:
+            # Candidate: parent.x
+            candidate = f"{parent_package}.{import_name}" if import_name else parent_package
+            
+            # Check exact match
+            if candidate in all_modules:
+                return candidate
+            
+            # Check if it's a package (folder) importing a module inside it
+            # e.g. 'from .' import 'utils' inside 'pkg' might mean 'pkg.utils'
+            candidate_sub = f"{candidate}.{import_name}" if import_name else candidate
+            if candidate_sub in all_modules:
+                return candidate_sub
+
+    # --- CASE 2: Absolute Import (import x or from x import y) ---
+    else:
+        # 2a. Direct Match (The perfect scenario)
+        if import_name in all_modules:
+            return import_name
+
+        # 2b. "Source Root" Simulation (The Fix for your issue)
+        # If user uploaded 'price_comp/scrapers/run.py' (module: price_comp.scrapers.run)
+        # But code imports 'scrapers.run'
+        # We check if any module *ends with* the import name AND follows the path structure.
+        
+        for candidate in all_modules:
+            # Logic: If candidate is 'price_comp.scrapers.run' and import is 'scrapers.run'
+            # Check if it ends with it.
+            if candidate.endswith(f".{import_name}"):
+                return candidate
+            
+            # Logic: If import is just 'scrapers', look for 'price_comp.scrapers.__init__' or just matching folder logic
+            # (Simplified for single files):
+            if candidate.endswith(f".{import_name}"): 
+                return candidate
+
+    return None
 
 def analyze_imports_from_string(source_code):
-    """Parses imports from a string of code."""
+    """Extracts module imports using AST."""
     try:
         tree = ast.parse(source_code)
     except Exception:
-        return set()
+        return []
 
-    imported_names = set()
+    imports = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                imported_names.add(alias.name)
+                imports.append({"name": alias.name, "level": 0})
         elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imported_names.add(node.module)
-                for name in node.names:
-                    imported_names.add(name.name)
-                    imported_names.add(f"{node.module}.{name.name}")
-    return imported_names
-
-def process_file_content(filename, content_bytes, file_content_map, file_name_map):
-    """Helper to decode and store file content."""
-    try:
-        # Create a clean module ID from path: 'src/utils/helper.py' -> 'src.utils.helper'
-        clean_name = filename.replace("\\", "/").replace("/", ".").replace(".py", "")
-        
-        # Decode bytes to string
-        source_code = content_bytes.decode("utf-8")
-        
-        file_content_map[clean_name] = source_code
-        file_name_map[clean_name] = filename
-    except Exception:
-        pass # Skip binary or non-utf8 files
+            level = node.level # 0=absolute, 1='.', 2='..'
+            module = node.module or ""
+            for alias in node.names:
+                # Store enough info to reconstruct: 'from x import y' -> name='x.y'
+                full_name = f"{module}.{alias.name}" if module else alias.name
+                imports.append({"name": full_name, "level": level})
+    return imports
 
 def build_graph_from_uploads(uploaded_files):
     """
-    Handles both raw .py files AND .zip archives.
+    Builds the dependency graph using STRICT resolution.
     """
     file_content_map = {}
     file_name_map = {} 
-
+    
+    # 1. READ FILES
     for uploaded_file in uploaded_files:
-        
-        # CASE A: User uploaded a ZIP file (The best way to upload folders)
-        if uploaded_file.name.endswith(".zip"):
-            with zipfile.ZipFile(uploaded_file) as z:
-                for filename in z.namelist():
-                    if filename.endswith(".py") and not filename.startswith("__MACOSX"):
-                        with z.open(filename) as f:
-                            process_file_content(filename, f.read(), file_content_map, file_name_map)
-                            
-        # CASE B: User uploaded raw .py files
-        elif uploaded_file.name.endswith(".py"):
-            # Use the full path if browser provided it, else filename
-            filename = getattr(uploaded_file, "name", uploaded_file.name)
-            process_file_content(filename, uploaded_file.getvalue(), file_content_map, file_name_map)
+        content = None
+        filename = uploaded_file.name
 
-    # --- Build Dependency Graph ---
+        if filename.endswith(".zip"):
+            with zipfile.ZipFile(uploaded_file) as z:
+                for z_name in z.namelist():
+                    if z_name.endswith(".py") and not z_name.startswith("__MACOSX"):
+                        with z.open(z_name) as f:
+                            clean_id = normalize_path_to_module(z_name)
+                            file_content_map[clean_id] = f.read().decode("utf-8")
+                            file_name_map[clean_id] = z_name
+        
+        elif filename.endswith(".py"):
+            filename = getattr(uploaded_file, "name", uploaded_file.name)
+            clean_id = normalize_path_to_module(filename)
+            try:
+                file_content_map[clean_id] = uploaded_file.getvalue().decode("utf-8")
+                file_name_map[clean_id] = filename
+            except:
+                pass
+
+    all_modules = set(file_content_map.keys())
     nodes = []
     edges = set()
 
+    # 2. CREATE NODES
+    for module_id in file_content_map:
+        nodes.append({"id": module_id, "label": os.path.basename(file_name_map[module_id])})
+
+    # 3. RESOLVE IMPORTS (The Smart Part)
     for current_module, source_code in file_content_map.items():
-        nodes.append({"id": current_module, "filename": file_name_map[current_module]})
-        
         raw_imports = analyze_imports_from_string(source_code)
         
-        for imp in raw_imports:
-            target_match = None
+        for imp_data in raw_imports:
+            # Try to resolve 'import x' to a real file in our list
+            target = resolve_import(imp_data["name"], current_module, all_modules, imp_data["level"])
             
-            # Logic 1: Exact Match (import utils)
-            if imp in file_content_map:
-                target_match = imp
-            
-            # Logic 2: Submodule Match (from utils import helper)
-            else:
-                parts = imp.split('.')
-                # Check backwards: utils.helper.func -> check 'utils.helper', then 'utils'
-                for i in range(len(parts), 0, -1):
-                    candidate = ".".join(parts[:i])
-                    if candidate in file_content_map:
-                        target_match = candidate
+            # If explicit match failed, try splitting (e.g. import x.y.z -> maybe x.y is the file)
+            if not target and "." in imp_data["name"] and imp_data["level"] == 0:
+                parts = imp_data["name"].split(".")
+                for i in range(len(parts)-1, 0, -1):
+                    sub_import = ".".join(parts[:i])
+                    target = resolve_import(sub_import, current_module, all_modules, 0)
+                    if target:
                         break
 
-            if target_match and target_match != current_module:
-                edges.add((current_module, target_match))
+            if target and target != current_module:
+                edges.add((current_module, target))
 
     edges_list = [{"source": s, "target": t} for s, t in edges]
     
     return {
         "nodes": nodes, 
         "edges": edges_list, 
-        "content_map": file_content_map,
+        "content_map": file_content_map, 
         "name_map": file_name_map
     }
 
-# --- 2. AI AGENT ---
+# --- 2. ROBUST AI AGENT ---
 
 class CodeChangeAgent:
     def __init__(self, graph_data):
@@ -331,8 +388,8 @@ class CodeChangeAgent:
         
         if api_key:
             genai.configure(api_key=api_key)
-            # Use stable model
-            self.model = genai.GenerativeModel("gemini-2.5-flash") 
+            self.model = genai.GenerativeModel("gemini-1.5-flash")
+            self.backup_model = genai.GenerativeModel("gemini-pro")
         else:
             self.model = None
 
@@ -350,30 +407,24 @@ class CodeChangeAgent:
         if self.graph_data['edges']:
             edges_desc = "\n".join([f"{e['source']} imports {e['target']}" for e in self.graph_data['edges']])
 
-        # Identify Entry Points
-        entry_list = ['app', 'main', 'manage', 'wsgi', 'streamlit_app', 'cli']
-        potential_entry_points = [m for m in self.content_map.keys() if any(e in m.lower() for e in entry_list)]
-        
-        entry_instruction = ""
-        if potential_entry_points:
-            entry_instruction = f"CRITICAL: The following are ENTRY POINTS (Apps): {potential_entry_points}. Do not call them redundant."
-
         prompt = f"""
         You are a Senior Software Architect.
-        {entry_instruction}
-        
-        PROJECT ARCHITECTURE:
-        {edges_desc}
-        
-        SOURCE CODE:
-        {context}
-        
+        PROJECT ARCHITECTURE: {edges_desc}
+        SOURCE CODE: {context}
         USER QUESTION: {query}
         """
+
         try:
             return self.model.generate_content(prompt).text
         except Exception as e:
-            return f"Error: {e}"
+            error_msg = str(e)
+            if "429" in error_msg or "quota" in error_msg.lower():
+                try:
+                    return f"⚠️ Quota exceeded. Using backup model...\n\n" + \
+                           self.backup_model.generate_content(prompt).text
+                except:
+                    return "❌ **Daily Quota Exceeded**."
+            return f"⚠️ Error: {error_msg}"
 
 # --- 3. UI SETUP ---
 
@@ -383,92 +434,59 @@ st.title("☁️ CodeMap: Cloud Architecture")
 if 'chat_history' not in st.session_state:
     st.session_state['chat_history'] = []
 
-# --- SIDEBAR ---
 st.sidebar.header("📂 Project Upload")
-st.sidebar.info("💡 **Tip:** For best results, zip your folder and upload the **.zip** file!")
-
-# Allow Zip OR Multiple Python files
 uploaded_files = st.sidebar.file_uploader(
-    "Upload .zip or .py files:", 
+    "Upload .zip or drag folder:", 
     accept_multiple_files=True, 
     type=["py", "zip"]
 )
 
 if uploaded_files:
-    if st.sidebar.button("🚀 Analyze Files"):
-        with st.spinner("Unzipping and Analyzing..."):
+    if st.sidebar.button("🚀 Analyze"):
+        with st.spinner("Analyzing..."):
             graph_data = build_graph_from_uploads(uploaded_files)
-            
             if not graph_data['nodes']:
-                st.error("No Python files found! Did you upload a valid zip or .py files?")
+                st.error("No Python files found!")
             else:
                 st.session_state['graph'] = graph_data
                 st.session_state['agent'] = CodeChangeAgent(graph_data)
-                st.session_state['chat_history'] = [] 
-                st.success(f"Successfully analyzed {len(graph_data['nodes'])} modules!")
-else:
-    st.sidebar.info("👆 Upload a .zip of your project to start.")
-
-# --- MAIN UI ---
+                st.session_state['chat_history'] = []
+                st.success(f"Analyzed {len(graph_data['nodes'])} modules!")
 
 if 'graph' in st.session_state:
     data = st.session_state['graph']
     
-    # Navigation
-    view_mode = st.radio(
-        "Menu:", 
-        ["🕸️ Architecture Map", "💬 Ask the Codebase"], 
-        horizontal=True,
-        label_visibility="collapsed"
-    )
+    view_mode = st.radio("Menu:", ["🕸️ Architecture", "💬 Ask AI"], horizontal=True, label_visibility="collapsed")
     st.markdown("---") 
 
-    # VIEW 1
-    if view_mode == "🕸️ Architecture Map":
-        st.subheader("Dependency Graph")
+    if view_mode == "🕸️ Architecture":
         viz = graphviz.Digraph()
-        viz.attr(rankdir='LR')
+        viz.attr(rankdir='TB') 
         viz.attr('node', shape='box', style='filled', fillcolor='#E0F7FA', fontname='Arial')
         
         for node in data['nodes']:
-            viz.node(node['id'], node['filename'])
+            viz.node(node['id'], node['label'])
         for edge in data['edges']:
             viz.edge(edge['source'], edge['target'])
-            
         st.graphviz_chart(viz)
 
-    # VIEW 2
-    elif view_mode == "💬 Ask the Codebase":
-        st.subheader("👩‍💻 Onboarding Assistant")
-        
+    elif view_mode == "💬 Ask AI":
         all_modules = list(data['content_map'].keys())
-        selected_modules = st.multiselect(
-            "Select files to discuss (Default = All):", 
-            all_modules,
-            format_func=lambda x: data['name_map'][x]
-        )
+        selected = st.multiselect("Select files:", all_modules, format_func=lambda x: data['name_map'][x])
         
-        # History
         for msg in st.session_state['chat_history']:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-        # Input
-        with st.form(key="ask_form", clear_on_submit=False):
-            user_query = st.text_input("Ask a question:", placeholder="e.g., Which files are redundant?")
-            submit_button = st.form_submit_button("Ask AI")
-            
-            if submit_button and user_query:
+        with st.form("ask_form"):
+            query = st.text_input("Question:")
+            if st.form_submit_button("Ask"):
                 agent = st.session_state['agent']
-                target_modules = selected_modules if selected_modules else all_modules
+                target = selected if selected else all_modules
+                st.session_state['chat_history'].append({"role": "user", "content": query})
+                with st.chat_message("user"): st.markdown(query)
                 
-                with st.chat_message("user"):
-                    st.markdown(user_query)
-                st.session_state['chat_history'].append({"role": "user", "content": user_query})
-                
-                with st.spinner("Analyzing..."):
-                    response = agent.explain_code(target_modules, user_query)
-                    
-                    with st.chat_message("assistant"):
-                        st.markdown(response)
-                    st.session_state['chat_history'].append({"role": "assistant", "content": response})
+                with st.spinner("Thinking..."):
+                    resp = agent.explain_code(target, query)
+                    st.session_state['chat_history'].append({"role": "assistant", "content": resp})
+                    with st.chat_message("assistant"): st.markdown(resp)
