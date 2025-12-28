@@ -332,7 +332,7 @@ class CodeChangeAgent:
         if api_key:
             genai.configure(api_key=api_key)
             # Use stable model
-            self.model = genai.GenerativeModel("gemini-1.5-flash") 
+            self.model = genai.GenerativeModel("gemini-2.5-flash") 
         else:
             self.model = None
 
