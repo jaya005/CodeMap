@@ -224,9 +224,7 @@ except:
 # --- 1. CLOUD-COMPATIBLE BACKEND LOGIC ---
 
 def analyze_imports_from_string(source_code):
-    """
-    Parses imports from a string of code (instead of a file path).
-    """
+    """Parses imports from a string of code."""
     try:
         tree = ast.parse(source_code)
     except Exception:
@@ -246,43 +244,49 @@ def analyze_imports_from_string(source_code):
     return imported_names
 
 def build_graph_from_uploads(uploaded_files):
-    """
-    Processes uploaded files from Streamlit memory.
-    """
-    # 1. Read all files into a dictionary: {'module_name': 'source_code'}
+    """Processes uploaded files and preserves folder structure."""
     file_content_map = {}
-    file_name_map = {} # Maps module name -> original filename (e.g. 'utils' -> 'utils.py')
+    file_name_map = {} 
 
     for uploaded_file in uploaded_files:
-        filename = uploaded_file.name
-        if filename.endswith(".py"):
-            module_name = os.path.splitext(filename)[0]
-            # Read bytes -> decode to string
-            content = uploaded_file.getvalue().decode("utf-8")
+        # Some browsers provide relative paths (folder/file.py)
+        # We replace slashes with dots for Python module notation
+        raw_path = getattr(uploaded_file, "name", uploaded_file.name)
+        
+        if raw_path.endswith(".py"):
+            # Clean path to create a module ID: 'folder/sub/file.py' -> 'folder.sub.file'
+            module_path = raw_path.replace("/", ".").replace("\\", ".").replace(".py", "")
             
-            file_content_map[module_name] = content
-            file_name_map[module_name] = filename
+            try:
+                content = uploaded_file.getvalue().decode("utf-8")
+                file_content_map[module_path] = content
+                file_name_map[module_path] = raw_path
+            except Exception:
+                continue # Skip files with encoding issues
 
-    # 2. Build Graph
     nodes = []
     edges = set()
 
     for current_module, source_code in file_content_map.items():
         nodes.append({"id": current_module, "filename": file_name_map[current_module]})
         
-        # Analyze imports from the source string
         raw_imports = analyze_imports_from_string(source_code)
         
         for imp in raw_imports:
             target_match = None
+            
+            # 1. Direct match (e.g., import utils.helper)
             if imp in file_content_map:
                 target_match = imp
+            # 2. Sub-module match (e.g., from utils import helper)
             else:
                 parts = imp.split('.')
-                if parts[-1] in file_content_map:
-                    target_match = parts[-1]
-                elif parts[0] in file_content_map:
-                    target_match = parts[0]
+                # Check if the start of the import matches a known local module
+                for i in range(len(parts), 0, -1):
+                    possible_match = ".".join(parts[:i])
+                    if possible_match in file_content_map:
+                        target_match = possible_match
+                        break
 
             if target_match and target_match != current_module:
                 edges.add((current_module, target_match))
@@ -303,12 +307,10 @@ class CodeChangeAgent:
         self.graph_data = graph_data
         self.content_map = graph_data['content_map']
         
-        # Get API key from Environment (Local) or Secrets (Cloud)
         api_key = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
         
         if api_key:
             genai.configure(api_key=api_key)
-            # Using the stable model for deployment
             self.model = genai.GenerativeModel("gemini-1.5-flash") 
         else:
             self.model = None
@@ -317,29 +319,29 @@ class CodeChangeAgent:
         if not self.model:
             return "⚠️ Google API Key not found. Please add it to Streamlit Secrets."
         
-        # 1. Prepare Code Context from Memory
         context = ""
         for module in selected_modules:
             code = self.content_map.get(module, "")
             filename = self.graph_data['name_map'].get(module, module)
             context += f"\n--- FILE: {filename} ---\n{code}\n"
 
-        # 2. Prepare Dependency Context
         edges_desc = "No dependencies detected."
         if self.graph_data['edges']:
             edges_desc = "\n".join([f"{e['source']} imports {e['target']}" for e in self.graph_data['edges']])
 
-        # 3. Entry Point Logic
-        potential_entry_points = [m for m in self.content_map.keys() if m in ['app', 'main', 'manage', 'wsgi', 'streamlit_app']]
+        # Standard entry points + common streamlit names
+        entry_list = ['app', 'main', 'manage', 'wsgi', 'streamlit_app', 'run']
+        potential_entry_points = [m for m in self.content_map.keys() if any(entry in m for entry in entry_list)]
+        
         entry_instruction = ""
         if potential_entry_points:
-            entry_instruction = f"CRITICAL: The following are ENTRY POINTS and are NOT redundant: {potential_entry_points}"
+            entry_instruction = f"CRITICAL: The following are likely ENTRY POINTS (not redundant): {potential_entry_points}"
 
         prompt = f"""
         You are a Senior Software Architect.
         {entry_instruction}
         
-        PROJECT ARCHITECTURE:
+        PROJECT ARCHITECTURE (Nodes and Edges):
         {edges_desc}
         
         SOURCE CODE:
@@ -348,7 +350,8 @@ class CodeChangeAgent:
         USER QUESTION: {query}
         """
         try:
-            return self.model.generate_content(prompt).text
+            response = self.model.generate_content(prompt)
+            return response.text
         except Exception as e:
             return f"Error: {e}"
 
@@ -360,24 +363,25 @@ st.title("☁️ CodeMap: Cloud Architecture")
 if 'chat_history' not in st.session_state:
     st.session_state['chat_history'] = []
 
-# --- SIDEBAR: FILE UPLOAD ---
-st.sidebar.header("📂 Upload Project")
+# --- SIDEBAR ---
+st.sidebar.header("📂 Project Upload")
+# accept_multiple_files allows dragging a whole folder in
 uploaded_files = st.sidebar.file_uploader(
-    "Upload your .py files here:", 
+    "Drag & drop your PROJECT FOLDER here", 
     accept_multiple_files=True, 
     type=["py"]
 )
 
 if uploaded_files:
-    if st.sidebar.button("🚀 Analyze Uploaded Files"):
-        with st.spinner("Processing files..."):
+    if st.sidebar.button("🚀 Analyze Folder Structure"):
+        with st.spinner("Processing directory..."):
             graph_data = build_graph_from_uploads(uploaded_files)
             st.session_state['graph'] = graph_data
             st.session_state['agent'] = CodeChangeAgent(graph_data)
             st.session_state['chat_history'] = [] 
-            st.success(f"Analyzed {len(graph_data['nodes'])} files!")
+            st.success(f"Successfully analyzed {len(graph_data['nodes'])} files!")
 else:
-    st.sidebar.info("👆 Upload files to begin.")
+    st.sidebar.info("👆 Drop your folder above to start.")
 
 # --- MAIN UI ---
 
@@ -385,50 +389,44 @@ if 'graph' in st.session_state:
     data = st.session_state['graph']
     
     view_mode = st.radio(
-        "Navigate:", 
-        ["🕸️ Architecture", "💬 Ask AI"], 
+        "Navigation:", 
+        ["🕸️ Architecture Map", "💬 Ask the Codebase"], 
         horizontal=True,
         label_visibility="collapsed"
     )
     st.markdown("---") 
 
-    # --- VIEW 1: ARCHITECTURE ---
-    if view_mode == "🕸️ Architecture":
+    if view_mode == "🕸️ Architecture Map":
         st.subheader("Dependency Graph")
         viz = graphviz.Digraph()
         viz.attr(rankdir='LR')
-        viz.attr('node', shape='box', style='filled', fillcolor='#E0F7FA')
+        viz.attr('node', shape='box', style='filled', fillcolor='#E0F7FA', fontname='Arial')
         
         for node in data['nodes']:
-            viz.node(node['id'], node['filename']) # Label with filename
+            # Using module path for ID, filename for label
+            viz.node(node['id'], node['filename']) 
         for edge in data['edges']:
             viz.edge(edge['source'], edge['target'])
             
         st.graphviz_chart(viz)
 
-    # --- VIEW 2: CHAT ---
-    elif view_mode == "💬 Ask AI":
-        st.subheader("👩‍💻 Code Assistant")
+    elif view_mode == "💬 Ask the Codebase":
+        st.subheader("👩‍💻 Onboarding Assistant")
         
-        # Helper lists
         all_modules = list(data['content_map'].keys())
-        all_filenames = [data['name_map'][m] for m in all_modules]
         
-        # Multi-select (Module Names)
         selected_modules = st.multiselect(
-            "Select Context (Empty = All Files):", 
+            "Select specific files/folders to discuss (Default = All):", 
             all_modules,
             format_func=lambda x: data['name_map'][x]
         )
         
-        # Chat History
         for msg in st.session_state['chat_history']:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-        # Input Form
-        with st.form(key="ask_form"):
-            user_query = st.text_input("Ask a question:", placeholder="e.g. Which files are redundant?")
+        with st.form(key="ask_form", clear_on_submit=False):
+            user_query = st.text_input("Ask a question about the codebase:", placeholder="e.g., How does the authentication flow work?")
             submit_button = st.form_submit_button("Ask AI")
             
             if submit_button and user_query:
@@ -439,7 +437,7 @@ if 'graph' in st.session_state:
                     st.markdown(user_query)
                 st.session_state['chat_history'].append({"role": "user", "content": user_query})
                 
-                with st.spinner("Thinking..."):
+                with st.spinner("Analyzing..."):
                     response = agent.explain_code(target_modules, user_query)
                     
                     with st.chat_message("assistant"):
@@ -447,4 +445,4 @@ if 'graph' in st.session_state:
                     st.session_state['chat_history'].append({"role": "assistant", "content": response})
 
 else:
-    st.info("👈 Please upload your Python files in the sidebar and click 'Analyze'.")
+    st.info("👈 Drop your folder in the sidebar to visualize your code architecture.")
